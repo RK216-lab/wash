@@ -1,753 +1,699 @@
-
-# Lab Wash V7 - ROIドラッグ選択 & テクスチャ・色判定 & タップ式黒白校正
-# 修正: 洗剤濃度→実験条件自由記述, ROIドラッグ, ガーゼ自動検出(テクスチャ+色), 黒白は画像タップで真っ黒・真っ白補正
-
 import streamlit as st
-from PIL import Image
-import numpy as np
 import cv2
+import numpy as np
 import pandas as pd
+from PIL import Image, ImageDraw
+from skimage.color import rgb2lab, deltaE_ciede2000
+import plotly.graph_objects as go
+import plotly.express as px
 import json
 import io
-import datetime
 import base64
-from typing import Dict, Tuple, Optional
+from datetime import date
 
-try:
-    from skimage.color import rgb2lab, rgb2xyz
-except ImportError:
-    rgb2lab = None
-    rgb2xyz = None
+# ReportLab imports for PDF generation
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
 
-try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
-    from reportlab.lib.units import mm
-except ImportError:
-    SimpleDocTemplate = None
+# Set Streamlit Page Configuration
+st.set_page_config(
+    page_title="Lab Wash V6 - 洗浄性評価アプリ",
+    page_icon="🧪",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-try:
-    from streamlit_paste_button import paste_button
-    HAS_PASTE = True
-except ImportError:
-    HAS_PASTE = False
-
-try:
-    from streamlit_drawable_canvas import st_canvas
-    HAS_CANVAS = True
-except ImportError:
-    HAS_CANVAS = False
-
-try:
-    from streamlit_image_coordinates import streamlit_image_coordinates
-    HAS_IMG_COORDS = True
-except ImportError:
-    HAS_IMG_COORDS = False
-
-st.set_page_config(page_title="Lab Wash V7", page_icon="🧪", layout="wide")
-
-def safe_divide(a,b,default=0.0):
-    try:
-        if b==0 or b is None or abs(b)<1e-9: return default
-        return a/b
-    except: return default
-
-def pil_to_cv(pil_img): return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-def cv_to_pil(cv_img): return Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
-
-def sample_color_at(pil_img, x, y, size=7):
-    """x,yは元画像座標、周辺平均でノイズ低減"""
-    try:
-        w,h = pil_img.size
-        x = int(np.clip(x,0,w-1))
-        y = int(np.clip(y,0,h-1))
-        half = size//2
-        x1 = max(0, x-half); y1 = max(0, y-half)
-        x2 = min(w, x+half+1); y2 = min(h, y+half+1)
-        crop = pil_img.crop((x1,y1,x2,y2))
-        arr = np.array(crop)
-        if arr.size==0: return (0,0,0)
-        mean = arr.mean(axis=(0,1))
-        return tuple(int(v) for v in mean[:3])
-    except:
-        return (0,0,0)
-
-def apply_bw_calibration(pil_img, black_rgb, white_rgb):
-    """ユーザーがタップした黒点を0,0,0 白点を255,255,255に正規化して条件を揃える"""
-    try:
-        img=np.array(pil_img).astype(np.float32)
-        black=np.array(black_rgb,dtype=np.float32).reshape(1,1,3)
-        white=np.array(white_rgb,dtype=np.float32).reshape(1,1,3)
-        denom=white-black
-        denom=np.where(np.abs(denom)<1e-6,1.0,denom)
-        corrected=(img-black)/denom*255.0
-        return Image.fromarray(np.clip(corrected,0,255).astype(np.uint8))
-    except Exception as e:
-        st.warning(f"色補正失敗:{e}")
-        return pil_img
-
-def extract_bw_auto(pil_img, percentile=2):
-    try:
-        arr=np.array(pil_img).reshape(-1,3)
-        low=np.percentile(arr,percentile,axis=0)
-        high=np.percentile(arr,100-percentile,axis=0)
-        return tuple(np.clip(low,0,255).astype(int)), tuple(np.clip(high,0,255).astype(int))
-    except: return (0,0,0),(255,255,255)
-
-def detect_gauze_advanced(roi_pil, color_sens=0.5, texture_sens=0.5, morph_k=7, use_kmeans=False):
-    """
-    ROI内からガーゼ領域をテクスチャ+色で自動検出
-    - 色: HSV S低 + V高 + Lab L高 = 白いガーゼ
-    - テクスチャ: 局所標準偏差で織り目を検出
-    - いびつな外形はapproxPolyDPで保持
-    """
-    try:
-        cv_img=pil_to_cv(roi_pil)
-        h,w = cv_img.shape[:2]
-        # リサイズして高速化(最大800px)
-        scale=1.0
-        if max(h,w)>800:
-            scale=800/max(h,w)
-            cv_small=cv2.resize(cv_img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
-        else:
-            cv_small=cv_img
-
-        # --- 色特徴 ---
-        hsv=cv2.cvtColor(cv_small, cv2.COLOR_BGR2HSV)
-        H,S,V=cv2.split(hsv)
-        # 感度で閾値可変
-        # color_sens 0..1: 0=厳しめ(白のみ), 1=緩め(薄汚れもガーゼ扱い)
-        s_thresh = int(60 + color_sens*60)  # 60-120: Sがこれ以下がガーゼ
-        v_thresh = int(200 - color_sens*40) # 160-200: Vがこれ以上がガーゼ
-        _, s_mask = cv2.threshold(S, s_thresh, 255, cv2.THRESH_BINARY_INV)
-        _, v_mask = cv2.threshold(V, v_thresh, 255, cv2.THRESH_BINARY)
-        color_mask = cv2.bitwise_and(s_mask, v_mask)
-
-        # Lab L
-        lab=cv2.cvtColor(cv_small, cv2.COLOR_BGR2LAB)
-        L,A,B=cv2.split(lab)
-        l_thresh = int(170 - color_sens*30) # 140-170
-        _, l_mask = cv2.threshold(L, l_thresh, 255, cv2.THRESH_BINARY)
-        color_mask = cv2.bitwise_and(color_mask, l_mask)
-
-        # --- テクスチャ特徴: 局所標準偏差 ---
-        gray=cv2.cvtColor(cv_small, cv2.COLOR_BGR2GRAY)
-        ksize=15
-        # 高速な局所分散計算: blurで平均
-        mean = cv2.GaussianBlur(gray, (ksize,ksize), 0)
-        sqr_mean = cv2.GaussianBlur((gray.astype(np.float32)**2), (ksize,ksize), 0)
-        std = np.sqrt(np.maximum(sqr_mean - mean.astype(np.float32)**2, 0))
-        # 正規化
-        if std.max()>1e-6:
-            std_norm = (std / std.max() * 255).astype(np.uint8)
-        else:
-            std_norm = np.zeros_like(gray, dtype=np.uint8)
-        # テクスチャ閾値
-        tex_low = int(8 + texture_sens*12)   # 8-20
-        tex_high = int(70 + texture_sens*30) # 70-100
-        _, tex_mask_low = cv2.threshold(std_norm, tex_low, 255, cv2.THRESH_BINARY)
-        _, tex_mask_high = cv2.threshold(std_norm, tex_high, 255, cv2.THRESH_BINARY_INV)
-        tex_mask = cv2.bitwise_and(tex_mask_low, tex_mask_high) # 中程度のテクスチャがガーゼ
-
-        # --- K-meansオプション (色で2クラス分離) ---
-        if use_kmeans:
-            try:
-                # Labのabでクラスタリング
-                data = lab.reshape(-1,3).astype(np.float32)
-                # L,a,bのうちa,bを重視
-                criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-                _, labels, centers = cv2.kmeans(data, 2, None, criteria, 3, cv2.KMEANS_RANDOM_CENTERS)
-                labels = labels.reshape(h_small:=cv_small.shape[0], -1)
-                # Lが高い方のクラスタをガーゼとみなす
-                # centersのLで判定
-                gauze_cluster = np.argmax(centers[:,0])
-                kmeans_mask = (labels==gauze_cluster).astype(np.uint8)*255
-                # color_maskと統合
-                color_mask = cv2.bitwise_or(color_mask, kmeans_mask)
-            except Exception as e:
-                pass
-
-        # --- 統合 ---
-        # ガーゼは色条件を満たしつつ、テクスチャも持つ -> ANDだが、テクスチャが弱い白地も拾うためORも混ぜる
-        combined = cv2.bitwise_and(color_mask, tex_mask)
-        # 色だけで十分白い領域も足す (テクスチャ弱い場合の救済)
-        combined = cv2.bitwise_or(combined, cv2.bitwise_and(color_mask, l_mask))
-
-        # --- モルフォロジー: 織り目の隙間を閉じつつ、いびつな外形は保持 ---
-        mk = max(1, morph_k)
-        if mk%2==0: mk+=1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (mk,mk))
-        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-        closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=2)
-        # 小穴埋め
-        closed = cv2.morphologyEx(closed, cv2.MORPH_CLOSE, kernel_small, iterations=1)
-        opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel_small, iterations=1)
-
-        # --- 輪郭抽出: いびつでもOKなようにapproxのepsilonを小さめに ---
-        contours,_ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            # フォールバック: color_maskをそのまま使う
-            final_mask = color_mask
-        else:
-            # 面積フィルタ: ROIの0.5%以上
-            total_area = opened.size
-            filtered = [c for c in contours if cv2.contourArea(c) > total_area*0.005]
-            if not filtered: filtered = contours
-            # 面積順
-            filtered = sorted(filtered, key=cv2.contourArea, reverse=True)
-            final_mask = np.zeros_like(gray)
-            # 上位2つまで統合 (ガーゼが分断している場合)
-            for c in filtered[:2]:
-                # いびつさを保持: epsilonを小さく (0.5%)
-                eps = 0.005 * cv2.arcLength(c, True)
-                approx = cv2.approxPolyDP(c, eps, True)
-                cv2.drawContours(final_mask, [approx], -1, 255, -1)
-            # 最終クローズで縁を滑らかにしすぎない程度に
-            final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel_small, iterations=1)
-
-        # 元サイズに戻す
-        if scale!=1.0:
-            final_mask = cv2.resize(final_mask, (w,h), interpolation=cv2.INTER_NEAREST)
-            color_mask_full = cv2.resize(color_mask, (w,h), interpolation=cv2.INTER_NEAREST)
-            tex_mask_full = cv2.resize(tex_mask, (w,h), interpolation=cv2.INTER_NEAREST)
-            combined_full = cv2.resize(combined, (w,h), interpolation=cv2.INTER_NEAREST)
-            std_norm_full = cv2.resize(std_norm, (w,h), interpolation=cv2.INTER_NEAREST)
-        else:
-            color_mask_full = color_mask
-            tex_mask_full = tex_mask
-            combined_full = combined
-            std_norm_full = std_norm
-
-        # オーバーレイ作成
-        overlay = cv_img.copy() if scale==1.0 else pil_to_cv(roi_pil)
-        # 元ROIサイズのoverlay用
-        if scale!=1.0:
-            cv_full = pil_to_cv(roi_pil)
-            overlay = cv_full
-
-        colored = cv2.applyColorMap(final_mask, cv2.COLORMAP_JET)
-        overlay_blend = cv2.addWeighted(overlay, 0.7, colored, 0.3, 0)
-        contours_final,_ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(overlay_blend, contours_final, -1, (0,255,0), 2)
-
-        return {
-            "mask": final_mask,
-            "overlay": cv_to_pil(overlay_blend),
-            "color_mask": Image.fromarray(color_mask_full),
-            "texture_mask": Image.fromarray(tex_mask_full),
-            "std_map": Image.fromarray(std_norm_full),
-            "combined": Image.fromarray(combined_full)
+# -----------------------------------------------------------------------------
+# SESSION STATE INITIALIZATION
+# -----------------------------------------------------------------------------
+def init_session_state():
+    if "metadata" not in st.session_state:
+        st.session_state.metadata = {
+            "exp_id": "EXP-2026-001",
+            "sample_name": "Standard Cotton Gauze",
+            "operator": "Tester A",
+            "condition": "40°C Standard Wash 30min",
+            "date": str(date.today())
         }
-    except Exception as e:
-        st.warning(f"高度検出エラー:{e}")
-        import traceback
-        st.code(traceback.format_exc())
-        h,w = roi_pil.size[1], roi_pil.size[0]
-        dummy = np.ones((h,w),dtype=np.uint8)*255
-        return {"mask":dummy, "overlay":roi_pil, "color_mask":roi_pil, "texture_mask":roi_pil, "std_map":roi_pil, "combined":roi_pil}
+    if "images" not in st.session_state:
+        st.session_state.images = {"base": None, "before": None, "after": None}
+    if "weights" not in st.session_state:
+        st.session_state.weights = {"base": 0.0, "before": 0.0, "after": 0.0}
+    if "calib_enabled" not in st.session_state:
+        st.session_state.calib_enabled = False
+    if "calib_points" not in st.session_state:
+        st.session_state.calib_points = {
+            "base": {"black": [15, 15, 15], "white": [240, 240, 240]},
+            "before": {"black": [15, 15, 15], "white": [240, 240, 240]},
+            "after": {"black": [15, 15, 15], "white": [240, 240, 240]}
+        }
+    if "roi" not in st.session_state:
+        st.session_state.roi = {
+            "use_common": True,
+            "common": {"x": 10, "y": 10, "w": 80, "h": 80}, # percentage
+            "base": {"x": 10, "y": 10, "w": 80, "h": 80},
+            "before": {"x": 10, "y": 10, "w": 80, "h": 80},
+            "after": {"x": 10, "y": 10, "w": 80, "h": 80}
+        }
+    if "gauze_params" not in st.session_state:
+        st.session_state.gauze_params = {
+            "blur_kernel": 5,
+            "thresh_offset": 0,
+            "morph_kernel": 5,
+            "min_area_pct": 5.0,
+            "binarize_method": "Otsu",
+            "invert_mask": False
+        }
 
-def get_mean_rgb_lab_xyz(pil_img,mask=None):
-    try:
-        img_np=np.array(pil_img)
-        if mask is not None:
-            if mask.shape[:2]!=img_np.shape[:2]:
-                mask=cv2.resize(mask,(img_np.shape[1],img_np.shape[0]),interpolation=cv2.INTER_NEAREST)
-            valid=mask>127
-            if np.sum(valid)<10: valid=np.ones((img_np.shape[0],img_np.shape[1]),dtype=bool)
-        else: valid=np.ones((img_np.shape[0],img_np.shape[1]),dtype=bool)
-        mean_rgb=np.mean(img_np[valid],axis=0)
-        rgb_norm=img_np.astype(np.float32)/255.0
-        lab=rgb2lab(rgb_norm); xyz=rgb2xyz(rgb_norm)
-        mean_lab=np.mean(lab[valid],axis=0); mean_xyz=np.mean(xyz[valid],axis=0)
-        return {"R":float(mean_rgb[0]),"G":float(mean_rgb[1]),"B":float(mean_rgb[2]),"L":float(mean_lab[0]),"a":float(mean_lab[1]),"b":float(mean_lab[2]),"X":float(mean_xyz[0]*100),"Y":float(mean_xyz[1]*100),"Z":float(mean_xyz[2]*100)}
-    except Exception as e:
-        st.warning(f"色彩計算エラー:{e}")
-        return {"R":0,"G":0,"B":0,"L":0,"a":0,"b":0,"X":0,"Y":0,"Z":0}
+init_session_state()
 
-def calc_deltaE76(lab1,lab2): return float(np.sqrt((lab1["L"]-lab2["L"])**2+(lab1["a"]-lab2["a"])**2+(lab1["b"]-lab2["b"])**2))
-def calc_deltaE2000(lab1,lab2):
-    try:
-        L1,a1,b1=lab1["L"],lab1["a"],lab1["b"]; L2,a2,b2=lab2["L"],lab2["a"],lab2["b"]
-        C1=np.sqrt(a1**2+b1**2); C2=np.sqrt(a2**2+b2**2); C_bar=(C1+C2)/2
-        G=0.5*(1-np.sqrt((C_bar**7)/(C_bar**7+25**7+1e-12)))
-        a1p=(1+G)*a1; a2p=(1+G)*a2
-        C1p=np.sqrt(a1p**2+b1**2); C2p=np.sqrt(a2p**2+b2**2)
-        def hp(ap,b):
-            h=np.degrees(np.arctan2(b,ap))
-            return h+360 if h<0 else h
-        h1p=hp(a1p,b1); h2p=hp(a2p,b2)
-        dLp=L2-L1; dCp=C2p-C1p
-        dhp=0
-        if C1p*C2p>=1e-12:
-            dh=h2p-h1p
-            if abs(dh)<=180: dhp=dh
-            elif dh>180: dhp=dh-360
-            else: dhp=dh+360
-        dHp=2*np.sqrt(C1p*C2p)*np.sin(np.radians(dhp/2))
-        Lp_bar=(L1+L2)/2; Cp_bar=(C1p+C2p)/2
-        hp_bar=(h1p+h2p)/2 if abs(h1p-h2p)<=180 else (h1p+h2p+360)/2 if h1p+h2p<360 else (h1p+h2p-360)/2
-        T=1-0.17*np.cos(np.radians(hp_bar-30))+0.24*np.cos(np.radians(2*hp_bar))+0.32*np.cos(np.radians(3*hp_bar+6))-0.20*np.cos(np.radians(4*hp_bar-63))
-        dtheta=30*np.exp(-((hp_bar-275)/25)**2)
-        RC=2*np.sqrt((Cp_bar**7)/(Cp_bar**7+25**7+1e-12))
-        SL=1+(0.015*(Lp_bar-50)**2)/np.sqrt(20+(Lp_bar-50)**2+1e-12)
-        SC=1+0.045*Cp_bar; SH=1+0.015*Cp_bar*T
-        RT=-np.sin(np.radians(2*dtheta))*RC
-        return float(np.sqrt((dLp/SL)**2+(dCp/SC)**2+(dHp/SH)**2+RT*(dCp/SC)*(dHp/SH)))
-    except: return 0.0
+# -----------------------------------------------------------------------------
+# HELPER FUNCTIONS & COLOR SCIENCE MATH
+# -----------------------------------------------------------------------------
 
-def calc_KS(R): R=np.clip(R,0.001,0.999); return float(((1-R)**2)/(2*R))
-def calc_WI_ASTM(XYZ): return float(3.388*XYZ["Z"]-3.0*XYZ["Y"])
-def calc_WI_CIE(XYZ):
-    s=XYZ["X"]+XYZ["Y"]+XYZ["Z"]+1e-12
-    x=XYZ["X"]/s; y=XYZ["Y"]/s
-    return float(XYZ["Y"]+800*(0.3127-x)+1700*(0.3290-y))
+def calibrate_image(img_np, black_rgb, white_rgb):
+    """
+    2-Point Linear Calibration on RGB image array
+    """
+    if img_np is None:
+        return None
+    
+    img_float = img_np.astype(np.float32)
+    c_black = np.array(black_rgb, dtype=np.float32)
+    c_white = np.array(white_rgb, dtype=np.float32)
+    
+    # Avoid division by zero
+    diff = c_white - c_black
+    diff = np.where(diff == 0, 1e-5, diff)
+    
+    calibrated = (img_float - c_black) / diff * 255.0
+    calibrated = np.clip(calibrated, 0, 255).astype(np.uint8)
+    return calibrated
 
-def generate_pdf_buffer(metadata,weights,results_df,lab_data,wash_rates,images_dict,calibrated_dict):
-    if SimpleDocTemplate is None: return None
-    buffer=io.BytesIO()
-    doc=SimpleDocTemplate(buffer,pagesize=A4,rightMargin=20*mm,leftMargin=20*mm,topMargin=15*mm,bottomMargin=15*mm)
-    styles=getSampleStyleSheet()
-    story=[]
-    story.append(Paragraph("<b>Lab Wash V7 レポート - ROIドラッグ & タップ校正</b>",styles['Title']))
-    story.append(Spacer(1,10*mm))
-    meta_rows=[["実験ID",metadata.get("exp_id",""),"実施日",str(metadata.get("date",""))],["試料名",metadata.get("sample_name",""),"担当者",metadata.get("operator","")],["温度",f"{metadata.get('temp','')} ℃","時間",f"{metadata.get('time','')} min"],["実験条件",metadata.get("exp_condition",""),"",""]]
-    t=Table(meta_rows,colWidths=[25*mm,50*mm,25*mm,50*mm])
-    t.setStyle(TableStyle([('BACKGROUND',(0,0),(0,-1),colors.HexColor("#E8F0FE")),('BACKGROUND',(2,0),(2,-1),colors.HexColor("#E8F0FE")),('GRID',(0,0),(-1,-1),0.5,colors.grey),('FONTSIZE',(0,0),(-1,-1),9)]))
-    story.append(Paragraph("<b>1. 実験条件</b>",styles['Heading2'])); story.append(t); story.append(Spacer(1,8*mm))
-    weight_rows=[["項目","素地","洗浄前","洗浄後"],["重量(g)",f"{weights.get('素地',0):.4f}",f"{weights.get('洗浄前',0):.4f}",f"{weights.get('洗浄後',0):.4f}"],["汚染量(g)",f"{wash_rates.get('contamination',0):.4f}","",""],["除去量(g)",f"{wash_rates.get('removed',0):.4f}","",""],["重量洗浄率(%)",f"{wash_rates.get('weight_rate',0):.2f}","",""]]
-    wt=Table(weight_rows,colWidths=[35*mm,35*mm,35*mm,35*mm])
-    wt.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor("#D0E0FF")),('GRID',(0,0),(-1,-1),0.5,colors.grey),('FONTSIZE',(0,0),(-1,-1),8)]))
-    story.append(Paragraph("<b>2. 重量評価</b>",styles['Heading2'])); story.append(wt); story.append(Spacer(1,8*mm))
-    if results_df is not None and not results_df.empty:
-        header=["指標"]+list(results_df.columns)
-        table_data=[header]
-        for idx,row in results_df.iterrows():
-            table_data.append([str(idx)]+[f"{v:.3f}" if isinstance(v,float) else str(v) for v in row.values])
-        ct=Table(table_data,colWidths=[35*mm]+[25*mm]*(len(header)-1))
-        ct.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor("#FFE0B2")),('GRID',(0,0),(-1,-1),0.5,colors.grey),('FONTSIZE',(0,0),(-1,-1),7)]))
-        story.append(Paragraph("<b>3. 色彩・光学評価</b>",styles['Heading2'])); story.append(ct)
-    doc.build(story)
-    buffer.seek(0)
-    return buffer
+def get_roi_crop(img_np, roi_pct):
+    """
+    Crops image according to percentage ROI bounds (x, y, w, h)
+    """
+    if img_np is None:
+        return None
+    h_img, w_img = img_np.shape[:2]
+    x = int((roi_pct["x"] / 100.0) * w_img)
+    y = int((roi_pct["y"] / 100.0) * h_img)
+    w = int((roi_pct["w"] / 100.0) * w_img)
+    h = int((roi_pct["h"] / 100.0) * h_img)
+    
+    x = max(0, min(x, w_img - 1))
+    y = max(0, min(y, h_img - 1))
+    w = max(1, min(w, w_img - x))
+    h = max(1, min(h, h_img - y))
+    
+    return img_np[y:y+h, x:x+w], (x, y, w, h)
 
-def init_state():
-    defaults={
-        "metadata":{"exp_id":"EXP-001","sample_name":"ガーゼ試料A","operator":"","temp":40.0,"time":10.0,"exp_condition":"中性洗剤0.1%, 浴比1:50, 振とう100rpm, pH7","date":datetime.date.today()},
-        "images":{"素地":None,"洗浄前":None,"洗浄後":None},
-        "weights":{"素地":1.0,"洗浄前":1.5,"洗浄後":1.1},
-        "black_white_points":{"素地":{"black":(0,0,0),"white":(255,255,255)},"洗浄前":{"black":(0,0,0),"white":(255,255,255)},"洗浄後":{"black":(0,0,0),"white":(255,255,255)}},
-        "roi_pct":{"common":{"x":0.05,"y":0.05,"w":0.9,"h":0.9,"use_common":True},"素地":{"x":0.05,"y":0.05,"w":0.9,"h":0.9},"洗浄前":{"x":0.05,"y":0.05,"w":0.9,"h":0.9},"洗浄後":{"x":0.05,"y":0.05,"w":0.9,"h":0.9}},
-        "calibrated_images":{"素地":None,"洗浄前":None,"洗浄後":None},
-        "masks":{"素地":None,"洗浄前":None,"洗浄後":None},
-        "results":None,"results_df":None,"lab_data":{},"wash_rates":{},
+def create_gauze_mask(roi_np, params):
+    """
+    Generates binary mask for gauze area within ROI using OpenCV
+    """
+    if roi_np is None:
+        return None, None
+    
+    gray = cv2.cvtColor(roi_np, cv2.COLOR_RGB2GRAY)
+    
+    # 1. Blur
+    ksize = params["blur_kernel"]
+    if ksize % 2 == 0:
+        ksize += 1
+    blurred = cv2.GaussianBlur(gray, (ksize, ksize), 0)
+    
+    # 2. Binarization
+    if params["binarize_method"] == "Otsu":
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else: # Adaptive
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 11, 2
+        )
+    
+    if params.get("invert_mask", False):
+        thresh = cv2.bitwise_not(thresh)
+        
+    # Apply Threshold Offset if needed
+    offset = params.get("thresh_offset", 0)
+    if offset != 0:
+        thresh = np.clip(thresh.astype(np.int16) + offset, 0, 255).astype(np.uint8)
+
+    # 3. Morphology
+    m_ksize = max(1, params["morph_kernel"])
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (m_ksize, m_ksize))
+    morphed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    morphed = cv2.morphologyEx(morphed, cv2.MORPH_OPEN, kernel)
+    
+    # 4. Contour filtering
+    contours, _ = cv2.findContours(morphed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mask = np.zeros_like(gray)
+    
+    roi_area = roi_np.shape[0] * roi_np.shape[1]
+    min_area = (params["min_area_pct"] / 100.0) * roi_area
+    
+    valid_contours = []
+    for c in contours:
+        if cv2.contourArea(c) >= min_area:
+            valid_contours.append(c)
+            
+    if valid_contours:
+        cv2.drawContours(mask, valid_contours, -1, 255, thickness=cv2.FILLED)
+    else:
+        # Fallback to entire ROI if no valid contour found
+        mask[:, :] = 255
+
+    # Visual result with green contour outline
+    contour_overlay = roi_np.copy()
+    cv2.drawContours(contour_overlay, valid_contours, -1, (0, 255, 0), 2)
+    
+    return mask, contour_overlay
+
+def compute_metrics(img_np, mask):
+    """
+    Computes mean L*a*b*, WI, K/S values for pixels within mask
+    """
+    if img_np is None or mask is None:
+        return None
+    
+    # Filter masked pixels
+    masked_pixels = img_np[mask > 0]
+    if len(masked_pixels) == 0:
+        masked_pixels = img_np.reshape(-1, 3)
+        
+    # RGB 0..1 float
+    rgb_float = masked_pixels.astype(np.float32) / 255.0
+    
+    # CIE L*a*b* calculation
+    lab_pixels = rgb_lab = rgb2lab(rgb_float.reshape(-1, 1, 3)).reshape(-1, 3)
+    mean_lab = np.mean(lab_pixels, axis=0)
+    L, a, b = mean_lab[0], mean_lab[1], mean_lab[2]
+    
+    # Whiteness Index (WI, ASTM E313 approx)
+    wi = 100.0 - np.sqrt((100.0 - L)**2 + a**2 + b**2)
+    
+    # Kubelka-Munk K/S calculation
+    # Clip R to avoid 0 division
+    r_clipped = np.clip(rgb_float, 1e-6, 1.0)
+    ks_channels = ((1.0 - r_clipped) ** 2) / (2.0 * r_clipped)
+    mean_ks_rgb = np.mean(ks_channels, axis=0)
+    
+    # Luminance Y
+    y = 0.2126 * r_clipped[:, 0] + 0.7152 * r_clipped[:, 1] + 0.0722 * r_clipped[:, 2]
+    y_clipped = np.clip(y, 1e-6, 1.0)
+    ks_y = np.mean(((1.0 - y_clipped) ** 2) / (2.0 * y_clipped))
+    
+    return {
+        "L": L, "a": a, "b": b,
+        "WI": wi,
+        "KS_R": mean_ks_rgb[0], "KS_G": mean_ks_rgb[1], "KS_B": mean_ks_rgb[2],
+        "KS_Y": ks_y,
+        "mean_rgb": np.mean(masked_pixels, axis=0)
     }
-    for k,v in defaults.items():
-        if k not in st.session_state: st.session_state[k]=v
 
-init_state()
+# -----------------------------------------------------------------------------
+# SIDEBAR: METADATA & CONTROL
+# -----------------------------------------------------------------------------
+st.sidebar.title("🧪 Lab Wash V6")
+st.sidebar.markdown("**試験布・ガーゼ洗浄性評価システム**")
+st.sidebar.divider()
 
-with st.sidebar:
-    st.title("🧪 Lab Wash V7")
-    st.caption("ドラッグROI + テクスチャ検出 + タップ校正")
-    st.markdown("**新機能**")
-    st.markdown("- ROI: ドラッグで選択\n- ガーゼ: 色+テクスチャで自動検出\n- 黒白: 画像タップで真っ黒・真っ白に補正")
-    if not HAS_CANVAS:
-        st.error("canvas未導入: streamlit-drawable-canvas")
-    if not HAS_IMG_COORDS:
-        st.error("タップ未導入: streamlit-image-coordinates")
-    if not HAS_PASTE:
-        st.warning("貼り付け: streamlit-paste-button推奨")
-    if st.button("🔄 全リセット"):
-        for k in list(st.session_state.keys()): del st.session_state[k]
-        init_state(); st.rerun()
+st.sidebar.subheader("📋 実験メタデータ")
+st.session_state.metadata["exp_id"] = st.sidebar.text_input("実験 ID", st.session_state.metadata["exp_id"])
+st.session_state.metadata["sample_name"] = st.sidebar.text_input("試料名 / 布種", st.session_state.metadata["sample_name"])
+st.session_state.metadata["operator"] = st.sidebar.text_input("担当者名", st.session_state.metadata["operator"])
+st.session_state.metadata["condition"] = st.sidebar.text_area("洗浄条件", st.session_state.metadata["condition"], height=70)
+st.session_state.metadata["date"] = st.sidebar.date_input("実施日", date.today()).strftime("%Y-%m-%d")
 
-tab1,tab2,tab3,tab4,tab5=st.tabs(["① 画像 & メタ","② タップ黒白校正","③ ドラッグROI & 自動検出","④ 解析","⑤ レポート"])
+st.sidebar.divider()
+st.sidebar.info("💡 Tab 1から順に処理を進行してください。")
 
+# -----------------------------------------------------------------------------
+# MAIN APP: TABS
+# -----------------------------------------------------------------------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "① 画像・重量入力", 
+    "② 黒白校正", 
+    "③ ROI・ガーゼ抽出", 
+    "④ 解析結果・評価", 
+    "⑤ レポート・エクスポート"
+])
+
+# -----------------------------------------------------------------------------
+# TAB 1: IMAGES & WEIGHTS
+# -----------------------------------------------------------------------------
 with tab1:
-    st.subheader("ステップ1: メタデータ & 画像アップロード")
-    c1,c2=st.columns(2)
-    with c1:
-        st.session_state.metadata["exp_id"]=st.text_input("実験ID",value=st.session_state.metadata.get("exp_id",""))
-        st.session_state.metadata["sample_name"]=st.text_input("試料名",value=st.session_state.metadata.get("sample_name",""))
-        st.session_state.metadata["operator"]=st.text_input("担当者名",value=st.session_state.metadata.get("operator",""))
-    with c2:
-        st.session_state.metadata["temp"]=st.number_input("洗浄温度 (℃)",value=float(st.session_state.metadata.get("temp",40)),step=1.0)
-        st.session_state.metadata["time"]=st.number_input("洗浄時間 (min)",value=float(st.session_state.metadata.get("time",10)),step=1.0)
-        st.session_state.metadata["date"]=st.date_input("実施日",value=st.session_state.metadata.get("date",datetime.date.today()))
-    st.session_state.metadata["exp_condition"]=st.text_area("実験条件 (温度・時間以外自由記述)",value=st.session_state.metadata.get("exp_condition",""),height=90,placeholder="例: 中性洗剤0.1%, 浴比1:50, pH7, 硬水, 前処理など")
-
-    st.divider()
-    st.markdown("### 画像アップロード - 貼り付け対応")
-
-    st.components.v1.html("""
-    <style>#paste-hint{border:2px dashed #4CAF50;border-radius:12px;padding:15px;text-align:center;background:#F1F8E9;}</style>
-    <div id="paste-hint" tabindex="0">📋 ここクリック → <b>Ctrl+V / Cmd+V</b> で貼り付け / ドラッグ&ドロップOK<div id="prev"></div></div>
-    <script>
-    const h=document.getElementById('paste-hint'); h.focus();
-    document.addEventListener('paste',e=>{
-      for(let it of e.clipboardData.items){ if(it.type.indexOf('image')!==-1){
-        const b=it.getAsFile(); const u=URL.createObjectURL(b);
-        document.getElementById('prev').innerHTML='<img src="'+u+'" style="max-width:100%;max-height:200px;border-radius:8px;margin-top:8px"><br><small style="color:green">✓ 検出! 下のボタンで取り込んでください</small>';
-      }}
-    });
-    </script>
-    """, height=150)
-
-    cols=st.columns(3)
-    for idx,key in enumerate(["素地","洗浄前","洗浄後"]):
-        with cols[idx]:
-            st.markdown(f"#### {key}")
-            up=st.file_uploader(f"{key}ファイル",type=["png","jpg","jpeg","bmp","tiff","webp"],key=f"upload_{key}",label_visibility="collapsed")
-            if up:
-                try:
-                    pil_img=Image.open(up).convert("RGB")
-                    st.session_state.images[key]=pil_img
-                    st.session_state.calibrated_images[key]=None
-                    st.session_state.masks[key]=None
-                except Exception as e: st.error(f"読込失敗:{e}")
-            if HAS_PASTE:
-                try:
-                    pasted=paste_button(f"📋 貼り付け {key}", key=f"paste_{key}")
-                    pil_from=None
-                    if pasted is not None:
-                        if isinstance(pasted, Image.Image): pil_from=pasted.convert("RGB")
-                        elif hasattr(pasted,'image_data') and pasted.image_data is not None:
-                            d=pasted.image_data
-                            if isinstance(d, Image.Image): pil_from=d.convert("RGB")
-                            elif isinstance(d, np.ndarray): pil_from=Image.fromarray(d).convert("RGB")
-                            elif isinstance(d,str) and d.startswith("data:image"):
-                                pil_from=Image.open(io.BytesIO(base64.b64decode(d.split(",",1)[1]))).convert("RGB")
-                    if pil_from:
-                        st.session_state.images[key]=pil_from
-                        st.session_state.calibrated_images[key]=None
-                        st.session_state.masks[key]=None
-                        st.success(f"{key} 貼り付け成功"); st.rerun()
-                except Exception as e: st.warning(f"貼り付けエラー:{e}")
+    st.header("① 画像読み込み & サンプル重量入力")
+    st.markdown("素地布（未汚染）、洗浄前汚染布、洗浄後布の3種類の画像と重量（g）を入力します。")
+    
+    cols = st.columns(3)
+    stages = [
+        ("base", "1. 素地布 (Base)", "標準未汚染布"),
+        ("before", "2. 洗浄前汚染布 (Before)", "人工汚染布"),
+        ("after", "3. 洗洗浄後布 (After)", "洗浄処理後の布")
+    ]
+    
+    for i, (key, title, desc) in enumerate(stages):
+        with cols[i]:
+            st.subheader(title)
+            st.caption(desc)
+            
+            # Weight input
+            st.session_state.weights[key] = st.number_input(
+                f"重量 (g) - {key.capitalize()}",
+                min_value=0.0,
+                value=float(st.session_state.weights[key]),
+                format="%.4f",
+                key=f"weight_input_{key}"
+            )
+            
+            # File Uploader
+            uploaded_file = st.file_uploader(
+                f"画像アップロード ({key})",
+                type=["png", "jpg", "jpeg", "tif", "tiff"],
+                key=f"uploader_{key}"
+            )
+            
+            if uploaded_file is not None:
+                img_pil = Image.open(uploaded_file).convert("RGB")
+                st.session_state.images[key] = np.array(img_pil)
+                
             if st.session_state.images[key] is not None:
-                st.image(st.session_state.images[key], caption=f"{key} {st.session_state.images[key].size[0]}x{st.session_state.images[key].size[1]}", use_container_width=True)
-            st.session_state.weights[key]=st.number_input(f"{key} 重量(g)",value=float(st.session_state.weights.get(key,0)),step=0.001,format="%.4f",key=f"weight_{key}")
-
-with tab2:
-    st.subheader("ステップ2: タップ式 黒白キャリブレーション")
-    st.caption("画像の中の黒い部分・白い部分をタップして、その点を真っ黒(0,0,0)・真っ白(255,255,255)に補正して条件を揃えます。")
-    if not HAS_IMG_COORDS:
-        st.error("`pip install streamlit-image-coordinates` が必要です。")
-        st.code("pip install streamlit-image-coordinates", language="bash")
-    else:
-        if all(v is None for v in st.session_state.images.values()):
-            st.warning("①で画像を登録してください")
-        else:
-            for key in ["素地","洗浄前","洗浄後"]:
-                pil_img = st.session_state.images.get(key)
-                if pil_img is None: continue
-                st.markdown(f"### {key}")
-                # 現在の黒白点表示
-                cur_black = st.session_state.black_white_points[key]["black"]
-                cur_white = st.session_state.black_white_points[key]["white"]
-                c1,c2,c3 = st.columns([1,1,2])
-                with c1:
-                    st.markdown("**黒点**")
-                    st.color_picker(f"現在の黒 {key}", value="#%02x%02x%02x"%cur_black, key=f"show_black_{key}", disabled=True)
-                    st.write(f"RGB: {cur_black}")
-                    if st.button(f"黒点をリセット {key}", key=f"reset_b_{key}"):
-                        st.session_state.black_white_points[key]["black"]=(0,0,0)
-                        st.rerun()
-                    st.markdown("**白点**")
-                    st.color_picker(f"現在の白 {key}", value="#%02x%02x%02x"%cur_white, key=f"show_white_{key}", disabled=True)
-                    st.write(f"RGB: {cur_white}")
-                    if st.button(f"白点をリセット {key}", key=f"reset_w_{key}"):
-                        st.session_state.black_white_points[key]["white"]=(255,255,255)
-                        st.rerun()
-                    st.divider()
-                    tap_mode = st.radio(f"タップモード {key}", ["黒点をタップして取得", "白点をタップして取得"], key=f"tapmode_{key}", horizontal=False)
-                    st.caption("画像をクリックすると、その位置の色を平均7x7で取得します。")
-                    if st.button(f"自動抽出 (フォールバック) {key}", key=f"auto_{key}"):
-                        b,w = extract_bw_auto(pil_img)
-                        st.session_state.black_white_points[key]["black"]=b
-                        st.session_state.black_white_points[key]["white"]=w
-                        st.rerun()
-
-                with c2:
-                    # タップ用表示画像: 600px幅にリサイズして表示 (座標変換用に比率保持)
-                    display_max = 600
-                    disp_img = pil_img.copy()
-                    # アスペクト保持でリサイズ
-                    if max(disp_img.size) > display_max:
-                        ratio = display_max / max(disp_img.size)
-                        new_size = (int(disp_img.size[0]*ratio), int(disp_img.size[1]*ratio))
-                        disp_img = disp_img.resize(new_size, Image.LANCZOS)
-                    st.markdown(f"**{key} 画像をクリック** - {tap_mode}")
-                    # 画像座標取得
-                    coords = streamlit_image_coordinates(disp_img, key=f"coord_{key}")
-                    if coords is not None:
-                        # coordsはdisplay画像上の座標
-                        # 元画像座標に変換
-                        scale_x = pil_img.size[0] / disp_img.size[0]
-                        scale_y = pil_img.size[1] / disp_img.size[1]
-                        orig_x = int(coords["x"] * scale_x)
-                        orig_y = int(coords["y"] * scale_y)
-                        sampled = sample_color_at(pil_img, orig_x, orig_y, size=9)
-                        if "黒点" in tap_mode:
-                            st.session_state.black_white_points[key]["black"] = sampled
-                            st.toast(f"{key} 黒点を取得: {sampled} at ({orig_x},{orig_y})")
-                        else:
-                            st.session_state.black_white_points[key]["white"] = sampled
-                            st.toast(f"{key} 白点を取得: {sampled} at ({orig_x},{orig_y})")
-                        # 少し待ってリラン
-                        st.rerun()
-
-                with c3:
-                    # 補正後プレビュー
-                    black = st.session_state.black_white_points[key]["black"]
-                    white = st.session_state.black_white_points[key]["white"]
-                    try:
-                        calibrated = apply_bw_calibration(pil_img, black, white)
-                        st.session_state.calibrated_images[key] = calibrated
-                        ca,cb = st.columns(2)
-                        with ca:
-                            st.image(pil_img, caption=f"元画像\n黒{black} 白{white}", use_container_width=True)
-                        with cb:
-                            st.image(calibrated, caption="補正後 (黒→0, 白→255)", use_container_width=True)
-                        # ヒストグラム的説明
-                        st.caption(f"補正式: (img - {black}) / ({white} - {black}) * 255 → 黒を真っ黒、白を真っ白に正規化して全画像の条件を揃えます")
-                    except Exception as e:
-                        st.error(f"補正エラー:{e}")
-                st.divider()
-
-with tab3:
-    st.subheader("ステップ3: ドラッグROI選択 & ガーゼ自動検出 (色+テクスチャ)")
-    st.caption("まず大まかにガーゼがある領域をドラッグで選択 → その中から色(白さ・低彩度)とテクスチャ(織り目)でいびつでも自動抽出")
-    if not HAS_CANVAS:
-        st.error("`pip install streamlit-drawable-canvas` が必要です")
-        st.code("pip install streamlit-drawable-canvas", language="bash")
-    else:
-        has_img = any(v is not None for v in st.session_state.images.values())
-        if not has_img:
-            st.warning("①で画像を登録してください")
-        else:
-            # 共通ROIか個別か
-            use_common = st.checkbox("共通ROIを使用 (全画像で同じ相対位置)", value=st.session_state.roi_pct["common"].get("use_common", True), key="use_common_roi")
-            st.session_state.roi_pct["common"]["use_common"] = use_common
-
-            # 検出パラメータ
-            with st.expander("🔧 自動検出パラメータ (色・テクスチャ感度)", expanded=True):
-                pc1,pc2,pc3 = st.columns(3)
-                with pc1:
-                    color_sens = st.slider("色感度 (白さ判定の緩さ)", 0.0, 1.0, 0.5, 0.05, key="color_sens", help="0=厳しめ(真っ白のみガーゼ), 1=緩め(薄汚れもガーゼとして許容)")
-                    texture_sens = st.slider("テクスチャ感度", 0.0, 1.0, 0.5, 0.05, key="tex_sens", help="織り目の検出しやすさ")
-                with pc2:
-                    morph_k = st.slider("モルフォロジー強度", 3, 21, 9, step=2, key="morph_k", help="いびつな隙間を埋める強さ")
-                    use_kmeans = st.checkbox("K-means色分離を併用 (背景が複雑な場合)", value=False, key="use_kmeans")
-                with pc3:
-                    st.info("**検出ロジック**\n- 色: HSV S低(低彩度) + V高(明るい) + Lab L高\n- テクスチャ: 局所標準偏差で織り目を検出\n- いびつでも輪郭をapproxPolyDPで保持")
-
-            def get_roi_from_canvas(canvas_result, canvas_w, canvas_h):
-                """canvasのrectからROI%を取得"""
-                if canvas_result.json_data is None: return None
-                objects = canvas_result.json_data.get("objects", [])
-                if not objects: return None
-                # 最後のrectを取得
-                rects = [o for o in objects if o.get("type")=="rect"]
-                if not rects: return None
-                r = rects[-1]
-                # left, top, width, height
-                left = r.get("left",0); top = r.get("top",0); w = r.get("width",0); h = r.get("height",0)
-                # canvasサイズに対する割合に変換 (0-1)
-                x_pct = left / canvas_w
-                y_pct = top / canvas_h
-                w_pct = w / canvas_w
-                h_pct = h / canvas_h
-                # クリップ
-                x_pct = max(0,min(x_pct,0.95)); y_pct = max(0,min(y_pct,0.95))
-                w_pct = max(0.05, min(w_pct, 1-x_pct)); h_pct = max(0.05, min(h_pct, 1-y_pct))
-                return {"x":x_pct,"y":y_pct,"w":w_pct,"h":h_pct}
-
-            def pct_to_pixels(pct, img_w, img_h):
-                x = int(pct["x"]*img_w); y = int(pct["y"]*img_h)
-                w = int(pct["w"]*img_w); h = int(pct["h"]*img_h)
-                x=max(0,min(x,img_w-10)); y=max(0,min(y,img_h-10))
-                w=max(10,min(w,img_w-x)); h=max(10,min(h,img_h-y))
-                return x,y,w,h
-
-            # 共通ROIモード
-            if use_common:
-                st.markdown("#### 共通ROIをドラッグで選択")
-                # 参照画像選択
-                ref_key = st.selectbox("参照画像 (ROI描画のベース)", [k for k,v in st.session_state.images.items() if v is not None], key="ref_img_common")
-                ref_img_orig = st.session_state.calibrated_images.get(ref_key) or st.session_state.images.get(ref_key)
-                if ref_img_orig:
-                    # canvas表示用にリサイズ (600px)
-                    canvas_max = 700
-                    ratio = canvas_max / max(ref_img_orig.size)
-                    if ratio<1:
-                        disp_w = int(ref_img_orig.size[0]*ratio)
-                        disp_h = int(ref_img_orig.size[1]*ratio)
-                        disp_img = ref_img_orig.resize((disp_w,disp_h), Image.LANCZOS)
-                    else:
-                        disp_w, disp_h = ref_img_orig.size
-                        disp_img = ref_img_orig
-
-                    st.caption(f"参照: {ref_key} - 緑の四角をドラッグで描画 → 自動で全画像に適用。描画後は少し待つと下に反映されます。")
-                    canvas_result = st_canvas(
-                        fill_color="rgba(0,255,0,0.15)",
-                        stroke_width=2,
-                        stroke_color="#00FF00",
-                        background_image=disp_img,
-                        background_color="#EEE",
-                        width=disp_w,
-                        height=disp_h,
-                        drawing_mode="rect",
-                        key="canvas_common",
-                        display_toolbar=True,
-                    )
-                    pct = get_roi_from_canvas(canvas_result, disp_w, disp_h)
-                    if pct:
-                        st.session_state.roi_pct["common"].update(pct)
-                        st.success(f"ROI取得: x={pct['x']:.2f} y={pct['y']:.2f} w={pct['w']:.2f} h={pct['h']:.2f} (相対)")
-
-                    # 現在のROI%表示
-                    cur_pct = st.session_state.roi_pct["common"]
-                    st.write(f"現在の共通ROI (相対): {cur_pct}")
-
-                    # 各画像で検出実行
-                    for key in ["素地","洗浄前","洗浄後"]:
-                        src = st.session_state.calibrated_images.get(key) or st.session_state.images.get(key)
-                        if src is None: continue
-                        st.markdown(f"##### {key} - ROI内自動検出")
-                        x,y,w,h = pct_to_pixels(cur_pct, src.size[0], src.size[1])
-                        roi_pil = src.crop((x,y,x+w,y+h))
-
-                        # 高度検出
-                        result = detect_gauze_advanced(roi_pil, color_sens=color_sens, texture_sens=texture_sens, morph_k=morph_k, use_kmeans=use_kmeans)
-
-                        # フルサイズマスク
-                        full_mask = np.zeros((src.size[1], src.size[0]), dtype=np.uint8)
-                        # result maskはroiサイズなので、元の位置に配置
-                        # result["mask"]はroiサイズ
-                        full_mask[y:y+h, x:x+w] = result["mask"]
-                        st.session_state.masks[key] = full_mask
-
-                        c1,c2,c3,c4,c5 = st.columns(5)
-                        with c1:
-                            # ROI位置
-                            cv_full = pil_to_cv(src)
-                            cv2.rectangle(cv_full, (x,y), (x+w,y+h), (0,255,0), 2)
-                            st.image(cv_to_pil(cv_full), caption="ROI位置", use_container_width=True)
-                        with c2:
-                            st.image(roi_pil, caption="ROIクロップ", use_container_width=True)
-                        with c3:
-                            st.image(result["color_mask"], caption="色マスク (白さ)", use_container_width=True)
-                            st.image(result["texture_mask"], caption="テクスチャマスク (織り目)", use_container_width=True)
-                        with c4:
-                            st.image(result["std_map"], caption="局所分散 (テクスチャ強度)", use_container_width=True)
-                            st.image(result["combined"], caption="統合マスク", use_container_width=True)
-                        with c5:
-                            st.image(result["overlay"], caption="最終オーバーレイ (いびつ対応)", use_container_width=True)
-
+                st.image(st.session_state.images[key], caption=f"{title} プレビュー", use_container_width=True)
+                st.success(f"画像読み込み完了 ({st.session_state.images[key].shape[1]}x{st.session_state.images[key].shape[0]} px)")
             else:
-                # 個別ROIモード
-                for key in ["素地","洗浄前","洗浄後"]:
-                    src = st.session_state.calibrated_images.get(key) or st.session_state.images.get(key)
-                    if src is None: continue
-                    st.markdown(f"#### {key} - 個別ROIドラッグ")
-                    # canvas用リサイズ
-                    canvas_max = 600
-                    ratio = canvas_max / max(src.size)
-                    if ratio<1:
-                        disp_w = int(src.size[0]*ratio); disp_h = int(src.size[1]*ratio)
-                        disp_img = src.resize((disp_w,disp_h), Image.LANCZOS)
-                    else:
-                        disp_w, disp_h = src.size
-                        disp_img = src
+                st.warning("画像が未選択です")
 
-                    canvas_result = st_canvas(
-                        fill_color="rgba(0,255,0,0.15)",
-                        stroke_width=2,
-                        stroke_color="#00FF00",
-                        background_image=disp_img,
-                        width=disp_w,
-                        height=disp_h,
-                        drawing_mode="rect",
-                        key=f"canvas_{key}",
-                        display_toolbar=True,
-                    )
-                    pct = get_roi_from_canvas(canvas_result, disp_w, disp_h)
-                    if pct:
-                        st.session_state.roi_pct[key].update(pct)
-                        st.success(f"{key} ROI更新")
+# Check if images are uploaded helper
+def check_images_uploaded():
+    return all(st.session_state.images[k] is not None for k in ["base", "before", "after"])
 
-                    cur_pct = st.session_state.roi_pct.get(key, {"x":0.05,"y":0.05,"w":0.9,"h":0.9})
-                    x,y,w,h = pct_to_pixels(cur_pct, src.size[0], src.size[1])
-                    roi_pil = src.crop((x,y,x+w,y+h))
-                    result = detect_gauze_advanced(roi_pil, color_sens=color_sens, texture_sens=texture_sens, morph_k=morph_k, use_kmeans=use_kmeans)
-                    full_mask = np.zeros((src.size[1], src.size[0]), dtype=np.uint8)
-                    full_mask[y:y+h, x:x+w] = result["mask"]
-                    st.session_state.masks[key] = full_mask
+# -----------------------------------------------------------------------------
+# TAB 2: BLACK & WHITE CALIBRATION
+# -----------------------------------------------------------------------------
+with tab2:
+    st.header("② 黒白キャリブレーション（2点色彩校正）")
+    
+    if not check_images_uploaded():
+        st.warning("⚠️ 先に【Tab 1: 画像・重量入力】で3種類すべての画像をアップロードしてください。")
+    else:
+        st.session_state.calib_enabled = st.checkbox(
+            "色校正（2点補正）を有効にする", 
+            value=st.session_state.calib_enabled
+        )
+        st.markdown("各画像上の「黒点（ブラックレベル）」および「白点（ホワイトレベル）」の参照RGB値を設定します。")
+        
+        calib_cols = st.columns(3)
+        for i, (key, title, _) in enumerate(stages):
+            with calib_cols[i]:
+                st.subheader(f"補正設定: {title}")
+                img = st.session_state.images[key]
+                h_img, w_img = img.shape[:2]
+                
+                st.markdown("**黒点 (Black Point) 座標**")
+                bx = st.slider(f"X (px) - 黒 - {key}", 0, w_img-1, int(w_img*0.05), key=f"bx_{key}")
+                by = st.slider(f"Y (px) - 黒 - {key}", 0, h_img-1, int(h_img*0.05), key=f"by_{key}")
+                
+                # 5x5 region average
+                bx_min, bx_max = max(0, bx-2), min(w_img, bx+3)
+                by_min, by_max = max(0, by-2), min(h_img, by+3)
+                black_rgb = np.mean(img[by_min:by_max, bx_min:bx_max], axis=(0, 1)).astype(int).tolist()
+                st.session_state.calib_points[key]["black"] = black_rgb
+                st.caption(f"検出黒RGB: `{black_rgb}`")
+                
+                st.markdown("**白点 (White Point) 座標**")
+                wx = st.slider(f"X (px) - 白 - {key}", 0, w_img-1, int(w_img*0.95), key=f"wx_{key}")
+                wy = st.slider(f"Y (px) - 白 - {key}", 0, h_img-1, int(h_img*0.95), key=f"wy_{key}")
+                
+                wx_min, wx_max = max(0, wx-2), min(w_img, wx+3)
+                wy_min, wy_max = max(0, wy-2), min(h_img, wy+3)
+                white_rgb = np.mean(img[wy_min:wy_max, wx_min:wx_max], axis=(0, 1)).astype(int).tolist()
+                st.session_state.calib_points[key]["white"] = white_rgb
+                st.caption(f"検出白RGB: `{white_rgb}`")
+                
+                # Visual preview with markers
+                preview_mark = img.copy()
+                cv2.rectangle(preview_mark, (bx-5, by-5), (bx+5, by+5), (255, 0, 0), 2)
+                cv2.rectangle(preview_mark, (wx-5, wy-5), (wx+5, wy+5), (0, 0, 255), 2)
+                
+                if st.session_state.calib_enabled:
+                    calibrated = calibrate_image(img, black_rgb, white_rgb)
+                    st.image(calibrated, caption=f"{key.capitalize()} 補正後プレビュー", use_container_width=True)
+                else:
+                    st.image(preview_mark, caption=f"{key.capitalize()} 参照点マーク（赤:黒点, 青:白点）", use_container_width=True)
 
-                    c1,c2,c3 = st.columns(3)
-                    with c1: st.image(roi_pil, caption="ROI", use_container_width=True)
-                    with c2: st.image(result["combined"], caption="統合マスク", use_container_width=True)
-                    with c3: st.image(result["overlay"], caption="最終", use_container_width=True)
+# -----------------------------------------------------------------------------
+# TAB 3: ROI & GAUZE EXTRACTION
+# -----------------------------------------------------------------------------
+with tab3:
+    st.header("③ ROI指定 & OpenCVガーゼ領域自動抽出")
+    
+    if not check_images_uploaded():
+        st.warning("⚠️ 先に【Tab 1: 画像・重量入力】で3種類すべての画像をアップロードしてください。")
+    else:
+        st.subheader("1. 関心領域 (ROI) 設定")
+        st.session_state.roi["use_common"] = st.checkbox(
+            "全画像に共通のROI領域を適用する", 
+            value=st.session_state.roi["use_common"]
+        )
+        
+        if st.session_state.roi["use_common"]:
+            col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+            st.session_state.roi["common"]["x"] = col_r1.slider("ROI Offset X (%)", 0, 90, st.session_state.roi["common"]["x"])
+            st.session_state.roi["common"]["y"] = col_r2.slider("ROI Offset Y (%)", 0, 90, st.session_state.roi["common"]["y"])
+            st.session_state.roi["common"]["w"] = col_r3.slider("ROI 幅 Width (%)", 10, 100, st.session_state.roi["common"]["w"])
+            st.session_state.roi["common"]["h"] = col_r4.slider("ROI 高さ Height (%)", 10, 100, st.session_state.roi["common"]["h"])
+            
+            for k in ["base", "before", "after"]:
+                st.session_state.roi[k] = st.session_state.roi["common"].copy()
+        
+        st.divider()
+        st.subheader("2. OpenCV ガーゼ抽出 パラメータ設定")
+        p_col1, p_col2, p_col3, p_col4 = st.columns(4)
+        
+        st.session_state.gauze_params["blur_kernel"] = p_col1.slider("ガウシアンフィルタ Kernel", 1, 15, st.session_state.gauze_params["blur_kernel"], step=2)
+        st.session_state.gauze_params["morph_kernel"] = p_col2.slider("モルフォロジー Kernel", 1, 15, st.session_state.gauze_params["morph_kernel"])
+        st.session_state.gauze_params["min_area_pct"] = p_col3.slider("最小輪郭面積フィルタ (%)", 0.1, 50.0, st.session_state.gauze_params["min_area_pct"])
+        st.session_state.gauze_params["binarize_method"] = p_col4.selectbox("二値化手法", ["Otsu", "Adaptive"], index=0)
+        
+        st.session_state.gauze_params["invert_mask"] = st.checkbox("二値化マスクを反転する", value=st.session_state.gauze_params["invert_mask"])
+        st.session_state.gauze_params["thresh_offset"] = st.slider("二値化閾値オフセット", -50, 50, st.session_state.gauze_params["thresh_offset"])
+        
+        st.divider()
+        st.subheader("3. 抽出結果プレビュー")
+        
+        roi_cols = st.columns(3)
+        st.session_state.gauze_masks = {}
+        
+        for i, (key, title, _) in enumerate(stages):
+            with roi_cols[i]:
+                st.write(f"**{title}**")
+                
+                raw_img = st.session_state.images[key]
+                if st.session_state.calib_enabled:
+                    raw_img = calibrate_image(raw_img, st.session_state.calib_points[key]["black"], st.session_state.calib_points[key]["white"])
+                
+                roi_img, _ = get_roi_crop(raw_img, st.session_state.roi[key])
+                mask, overlay = create_gauze_mask(roi_img, st.session_state.gauze_params)
+                
+                st.session_state.gauze_masks[key] = mask
+                
+                st.image(overlay, caption=f"{key.capitalize()} 抽出領域（緑枠）", use_container_width=True)
+                st.image(mask, caption=f"{key.capitalize()} 2値マスク", use_container_width=True)
 
+# -----------------------------------------------------------------------------
+# TAB 4: ANALYSIS & EVALUATION
+# -----------------------------------------------------------------------------
 with tab4:
-    st.subheader("ステップ4: 解析・洗浄率評価")
-    if rgb2lab is None:
-        st.error("scikit-image未導入")
+    st.header("④ 解析結果 & 洗浄率総合評価")
+    
+    if not check_images_uploaded():
+        st.warning("⚠️ 先に【Tab 1: 画像・重量入力】で3種類すべての画像をアップロードしてください。")
     else:
-        if st.button("🔬 解析実行", type="primary"):
-            try:
-                ws=float(st.session_state.weights.get("素地",0)); wb=float(st.session_state.weights.get("洗浄前",0)); wa=float(st.session_state.weights.get("洗浄後",0))
-                cont=wb-ws; rem=wb-wa; w_rate=safe_divide(rem,cont,0)*100
-                wash_rates={"contamination":cont,"removed":rem,"weight_rate":w_rate,"w_soil_free":ws,"w_before":wb,"w_after":wa}
-                lab_data={}
-                for key in ["素地","洗浄前","洗浄後"]:
-                    src=st.session_state.calibrated_images.get(key) or st.session_state.images.get(key)
-                    if src is None: lab_data[key]={"L":0,"a":0,"b":0,"X":0,"Y":0,"Z":0}; continue
-                    info=get_mean_rgb_lab_xyz(src,st.session_state.masks.get(key))
-                    R=safe_divide(info["Y"],100,0.5); R=np.clip(R,0.001,0.999)
-                    lab_data[key]={**info,"KS":calc_KS(R),"WI_ASTM":calc_WI_ASTM(info),"WI_CIE":calc_WI_CIE(info),"R_ref":R}
-                Ls=lab_data["素地"]["L"]; Lb=lab_data["洗浄前"]["L"]; La=lab_data["洗浄後"]["L"]
-                L_rate=safe_divide(La-Lb,Ls-Lb,0)*100
-                for k in ["洗浄前","洗浄後"]:
-                    lab_data[k]["dE76"]=calc_deltaE76(lab_data["素地"],lab_data[k]); lab_data[k]["dE00"]=calc_deltaE2000(lab_data["素地"],lab_data[k])
-                lab_data["洗浄後"]["dE76_before"]=calc_deltaE76(lab_data["洗浄前"],lab_data["洗浄後"])
-                rows=[]
-                for k in ["素地","洗浄前","洗浄後"]:
-                    d=lab_data[k]
-                    rows.append({"試料":k,"重量":wash_rates.get(f"w_{'soil_free' if k=='素地' else 'before' if k=='洗浄前' else 'after'}",0),"L*":d.get("L",0),"a*":d.get("a",0),"b*":d.get("b",0),"K/S":d.get("KS",0),"WI":d.get("WI_CIE",0),"ΔE00":d.get("dE00",0)})
-                df=pd.DataFrame(rows).set_index("試料")
-                summary=pd.DataFrame([{"指標":"重量洗浄率%","値":w_rate},{"指標":"L*洗浄率%","値":L_rate},{"指標":"汚染量","値":cont},{"指標":"除去量","値":rem}]).set_index("指標")
-                st.session_state.results_df=df; st.session_state.lab_data=lab_data; st.session_state.wash_rates={**wash_rates,"L_rate":L_rate}; st.session_state.results={"df_main":df,"summary":summary}
-                st.success("解析完了")
-            except Exception as e:
-                st.error(f"エラー: {e}"); import traceback; st.code(traceback.format_exc())
-        if st.session_state.get("results_df") is not None:
-            st.dataframe(st.session_state.results_df.style.format("{:.3f}"),use_container_width=True)
-            st.dataframe(st.session_state.results["summary"].style.format("{:.3f}"),use_container_width=True)
-            try:
-                import plotly.express as px
-                df_plot=st.session_state.results_df.reset_index()
-                st.plotly_chart(px.bar(df_plot,x="試料",y="L*",color="試料",title="L*比較"),use_container_width=True)
-                st.plotly_chart(px.bar(df_plot,x="試料",y="K/S",color="試料",title="K/S比較"),use_container_width=True)
-            except: st.bar_chart(st.session_state.results_df[["L*","K/S"]])
+        # A. Weight Washability Calculation
+        w_base = st.session_state.weights["base"]
+        w_before = st.session_state.weights["before"]
+        w_after = st.session_state.weights["after"]
+        
+        m_stain = w_before - w_base
+        m_removed = w_before - w_after
+        
+        if m_stain > 0:
+            w_weight = (m_removed / m_stain) * 100.0
+        else:
+            w_weight = 0.0
+            
+        # B. Color & Optical Computations
+        stage_metrics = {}
+        for key in ["base", "before", "after"]:
+            raw_img = st.session_state.images[key]
+            if st.session_state.calib_enabled:
+                raw_img = calibrate_image(raw_img, st.session_state.calib_points[key]["black"], st.session_state.calib_points[key]["white"])
+            
+            roi_img, _ = get_roi_crop(raw_img, st.session_state.roi[key])
+            mask = st.session_state.gauze_masks.get(key)
+            if mask is None or mask.shape != roi_img.shape[:2]:
+                mask, _ = create_gauze_mask(roi_img, st.session_state.gauze_params)
+                
+            stage_metrics[key] = compute_metrics(roi_img, mask)
+            
+        # Washability WL (L* based)
+        L_base = stage_metrics["base"]["L"]
+        L_before = stage_metrics["before"]["L"]
+        L_after = stage_metrics["after"]["L"]
+        
+        L_denom = L_base - L_before
+        if abs(L_denom) > 1e-5:
+            w_L = ((L_after - L_before) / L_denom) * 100.0
+        else:
+            w_L = 0.0
+            
+        # Color difference deltaE 1976 & CIEDE2000
+        lab_base = np.array([stage_metrics["base"]["L"], stage_metrics["base"]["a"], stage_metrics["base"]["b"]])
+        lab_before = np.array([stage_metrics["before"]["L"], stage_metrics["before"]["a"], stage_metrics["before"]["b"]])
+        lab_after = np.array([stage_metrics["after"]["L"], stage_metrics["after"]["a"], stage_metrics["after"]["b"]])
+        
+        dE76_stain = np.linalg.norm(lab_before - lab_base)
+        dE76_wash = np.linalg.norm(lab_after - lab_before)
+        dE76_residual = np.linalg.norm(lab_after - lab_base)
+        
+        dE00_stain = deltaE_ciede2000(lab_base.reshape(1,1,3), lab_before.reshape(1,1,3))[0,0]
+        dE00_wash = deltaE_ciede2000(lab_before.reshape(1,1,3), lab_after.reshape(1,1,3))[0,0]
+        dE00_residual = deltaE_ciede2000(lab_after.reshape(1,1,3), lab_base.reshape(1,1,3))[0,0]
+        
+        # K/S reduction rate
+        ks_before = stage_metrics["before"]["KS_Y"]
+        ks_after = stage_metrics["after"]["KS_Y"]
+        ks_base = stage_metrics["base"]["KS_Y"]
+        
+        ks_denom = ks_before - ks_base
+        if abs(ks_denom) > 1e-5:
+            w_ks = ((ks_before - ks_after) / ks_denom) * 100.0
+        else:
+            w_ks = 0.0
+            
+        # Key Summary Metrics Display
+        st.subheader("📊 主要評価指標 Summary")
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        
+        m_col1.metric("重量基準洗浄率 (W_w)", f"{w_weight:.2f} %", delta=f"除去量: {m_removed:.4f}g")
+        m_col2.metric("L*基準洗浄率 (W_L)", f"{w_L:.2f} %", delta=f"ΔL*: {L_after - L_before:+.2f}")
+        m_col3.metric("K/S低減率 (輝度Y)", f"{w_ks:.2f} %", delta=f"ΔK/S: {ks_before - ks_after:+.4f}")
+        m_col4.metric("色差 CIEDE2000 (対素地)", f"{dE00_residual:.2f}", delta=f"汚染時: {dE00_stain:.2f}", delta_color="inverse")
+        
+        st.divider()
+        st.subheader("📋 詳細解析データ一覧")
+        
+        data_df = pd.DataFrame({
+            "指標": ["L* (明度)", "a* (赤-緑)", "b* (黄-青)", "白さ指数 (WI)", "K/S (R)", "K/S (G)", "K/S (B)", "K/S (Y輝度)"],
+            "素地 (Base)": [
+                f"{stage_metrics['base']['L']:.2f}", f"{stage_metrics['base']['a']:.2f}", f"{stage_metrics['base']['b']:.2f}",
+                f"{stage_metrics['base']['WI']:.2f}", f"{stage_metrics['base']['KS_R']:.4f}", f"{stage_metrics['base']['KS_G']:.4f}",
+                f"{stage_metrics['base']['KS_B']:.4f}", f"{stage_metrics['base']['KS_Y']:.4f}"
+            ],
+            "洗浄前 (Before)": [
+                f"{stage_metrics['before']['L']:.2f}", f"{stage_metrics['before']['a']:.2f}", f"{stage_metrics['before']['b']:.2f}",
+                f"{stage_metrics['before']['WI']:.2f}", f"{stage_metrics['before']['KS_R']:.4f}", f"{stage_metrics['before']['KS_G']:.4f}",
+                f"{stage_metrics['before']['KS_B']:.4f}", f"{stage_metrics['before']['KS_Y']:.4f}"
+            ],
+            "洗浄後 (After)": [
+                f"{stage_metrics['after']['L']:.2f}", f"{stage_metrics['after']['a']:.2f}", f"{stage_metrics['after']['b']:.2f}",
+                f"{stage_metrics['after']['WI']:.2f}", f"{stage_metrics['after']['KS_R']:.4f}", f"{stage_metrics['after']['KS_G']:.4f}",
+                f"{stage_metrics['after']['KS_B']:.4f}", f"{stage_metrics['after']['KS_Y']:.4f}"
+            ]
+        })
+        st.dataframe(data_df, use_container_width=True)
+        
+        # Charts
+        st.divider()
+        st.subheader("📈 視覚的比較グラフ")
+        
+        g_col1, g_col2 = st.columns(2)
+        
+        with g_col1:
+            fig_lab = go.Figure(data=[
+                go.Bar(name='Base', x=['L*', 'a*', 'b*'], y=[lab_base[0], lab_base[1], lab_base[2]]),
+                go.Bar(name='Before', x=['L*', 'a*', 'b*'], y=[lab_before[0], lab_before[1], lab_before[2]]),
+                go.Bar(name='After', x=['L*', 'a*', 'b*'], y=[lab_after[0], lab_after[1], lab_after[2]])
+            ])
+            fig_lab.update_layout(title="CIE L*a*b* 表色系 比較", barmode='group', template="plotly_white")
+            st.plotly_chart(fig_lab, use_container_width=True)
+            
+        with g_col2:
+            fig_ks = go.Figure(data=[
+                go.Bar(name='Base', x=['Red', 'Green', 'Blue', 'Y_Luminance'], y=[stage_metrics['base']['KS_R'], stage_metrics['base']['KS_G'], stage_metrics['base']['KS_B'], stage_metrics['base']['KS_Y']]),
+                go.Bar(name='Before', x=['Red', 'Green', 'Blue', 'Y_Luminance'], y=[stage_metrics['before']['KS_R'], stage_metrics['before']['KS_G'], stage_metrics['before']['KS_B'], stage_metrics['before']['KS_Y']]),
+                go.Bar(name='After', x=['Red', 'Green', 'Blue', 'Y_Luminance'], y=[stage_metrics['after']['KS_R'], stage_metrics['after']['KS_G'], stage_metrics['after']['KS_B'], stage_metrics['after']['KS_Y']])
+            ])
+            fig_ks.update_layout(title="K/S値 (Kubelka-Munk) 比較", barmode='group', template="plotly_white")
+            st.plotly_chart(fig_ks, use_container_width=True)
 
+# -----------------------------------------------------------------------------
+# TAB 5: REPORT GENERATION & DATA EXPORT
+# -----------------------------------------------------------------------------
 with tab5:
-    st.subheader("ステップ5: レポート出力")
-    if st.session_state.get("results_df") is None: st.warning("先に解析実行")
+    st.header("⑤ レポート自動生成 & データエクスポート")
+    
+    if not check_images_uploaded():
+        st.warning("⚠️ 先に【Tab 1: 画像・重量入力】で3種類すべての画像をアップロードしてください。")
     else:
-        if st.button("📄 PDF生成",type="primary"):
-            pdf=generate_pdf_buffer(st.session_state.metadata,st.session_state.weights,st.session_state.results_df,st.session_state.lab_data,st.session_state.wash_rates,st.session_state.images,st.session_state.calibrated_images)
-            if pdf: st.session_state["pdf_buffer"]=pdf; st.success("生成完了")
-        if "pdf_buffer" in st.session_state and st.session_state["pdf_buffer"]:
-            st.download_button("⬇️ PDFダウンロード",data=st.session_state["pdf_buffer"],file_name=f"{st.session_state.metadata.get('exp_id','report')}_V7.pdf",mime="application/pdf")
-        csv=st.session_state.results_df.to_csv(encoding="utf-8-sig")
-        st.download_button("⬇️ CSV",data=csv,file_name="results.csv",mime="text/csv")
-        meta_copy=st.session_state.metadata.copy()
-        if isinstance(meta_copy.get("date"),(datetime.date,datetime.datetime)): meta_copy["date"]=meta_copy["date"].isoformat()
-        json_str=json.dumps({"metadata":meta_copy,"weights":st.session_state.weights,"lab_data":st.session_state.lab_data,"wash_rates":st.session_state.wash_rates,"roi_pct":st.session_state.roi_pct},ensure_ascii=False,indent=2,default=str)
-        st.download_button("⬇️ JSON",data=json_str,file_name="LabWash_V7.json",mime="application/json")
+        st.subheader("📄 PDFレポート発行 (ReportLab)")
+        
+        def generate_pdf_report():
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+            story = []
+            
+            styles = getSampleStyleSheet()
+            title_style = ParagraphStyle(
+                'TitleStyle',
+                parent=styles['Heading1'],
+                fontSize=20,
+                leading=24,
+                textColor=colors.HexColor("#1E3A8A"),
+                spaceAfter=15
+            )
+            h2_style = ParagraphStyle(
+                'H2Style',
+                parent=styles['Heading2'],
+                fontSize=14,
+                leading=18,
+                textColor=colors.HexColor("#1E40AF"),
+                spaceBefore=12,
+                spaceAfter=6
+            )
+            body_style = styles['Normal']
+            
+            # Title
+            story.append(Paragraph("Lab Wash V6 - 洗浄性評価試験報告書", title_style))
+            story.append(Spacer(1, 10))
+            
+            # Meta Table
+            meta_data = [
+                [Paragraph("<b>実験ID:</b>", body_style), st.session_state.metadata["exp_id"], Paragraph("<b>実施日:</b>", body_style), st.session_state.metadata["date"]],
+                [Paragraph("<b>試料名:</b>", body_style), st.session_state.metadata["sample_name"], Paragraph("<b>担当者:</b>", body_style), st.session_state.metadata["operator"]],
+                [Paragraph("<b>洗浄条件:</b>", body_style), st.session_state.metadata["condition"], "", ""]
+            ]
+            t_meta = Table(meta_data, colWidths=[80, 170, 80, 170])
+            t_meta.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#F3F4F6")),
+                ('TEXTCOLOR', (0,0), (-1,-1), colors.black),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D1D5DB")),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                ('SPAN', (1,2), (3,2)),
+            ]))
+            story.append(t_meta)
+            story.append(Spacer(1, 15))
+            
+            # Summary Table
+            story.append(Paragraph("1. 主要洗浄性評価結果", h2_style))
+            summary_data = [
+                ["評価項目", "計算値", "単位 / 備考"],
+                ["重量基準洗浄率 (W_w)", f"{w_weight:.2f}", "%"],
+                ["明度基準洗浄率 (W_L)", f"{w_L:.2f}", "%"],
+                ["K/S低減率 (Y輝度)", f"{w_ks:.2f}", "%"],
+                ["残留色差 ΔE*00 (対素地)", f"{dE00_residual:.2f}", "CIEDE2000"],
+                ["汚染時色差 ΔE*00 (汚染-素地)", f"{dE00_stain:.2f}", "CIEDE2000"]
+            ]
+            t_sum = Table(summary_data, colWidths=[200, 100, 200])
+            t_sum.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#1E40AF")),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#9CA3AF")),
+                ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor("#F9FAFB")]),
+            ]))
+            story.append(t_sum)
+            story.append(Spacer(1, 15))
+            
+            # Detailed Optics Table
+            story.append(Paragraph("2. 詳細色彩・光学データ", h2_style))
+            opt_data = [
+                ["段階", "L*", "a*", "b*", "WI", "K/S (Y)"],
+                ["素地 (Base)", f"{stage_metrics['base']['L']:.2f}", f"{stage_metrics['base']['a']:.2f}", f"{stage_metrics['base']['b']:.2f}", f"{stage_metrics['base']['WI']:.2f}", f"{stage_metrics['base']['KS_Y']:.4f}"],
+                ["洗浄前 (Before)", f"{stage_metrics['before']['L']:.2f}", f"{stage_metrics['before']['a']:.2f}", f"{stage_metrics['before']['b']:.2f}", f"{stage_metrics['before']['WI']:.2f}", f"{stage_metrics['before']['KS_Y']:.4f}"],
+                ["洗浄後 (After)", f"{stage_metrics['after']['L']:.2f}", f"{stage_metrics['after']['a']:.2f}", f"{stage_metrics['after']['b']:.2f}", f"{stage_metrics['after']['WI']:.2f}", f"{stage_metrics['after']['KS_Y']:.4f}"]
+            ]
+            t_opt = Table(opt_data, colWidths=[100, 80, 80, 80, 80, 80])
+            t_opt.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#3B82F6")),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#9CA3AF")),
+            ]))
+            story.append(t_opt)
+            
+            doc.build(story)
+            buffer.seek(0)
+            return buffer.getvalue()
 
-st.divider()
-st.caption("Lab Wash V7 | ドラッグROI + 色・テクスチャ自動検出 + タップ式黒白校正 | 真っ黒・真っ白正規化")
+        pdf_bytes = generate_pdf_report()
+        st.download_button(
+            label="📥 A4 PDFレポートをダウンロード",
+            data=pdf_bytes,
+            file_name=f"lab_wash_report_{st.session_state.metadata['exp_id']}.pdf",
+            mime="application/pdf",
+            use_container_width=True
+        )
+        
+        st.divider()
+        st.subheader("💾 データ エクスポート & インポート")
+        
+        col_ex1, col_ex2 = st.columns(2)
+        
+        # CSV Export
+        export_df = pd.DataFrame([{
+            **st.session_state.metadata,
+            "W_weight_%": w_weight,
+            "W_L_%": w_L,
+            "W_KS_%": w_ks,
+            "dE00_residual": dE00_residual,
+            "dE00_stain": dE00_stain,
+            "weight_base_g": w_base,
+            "weight_before_g": w_before,
+            "weight_after_g": w_after,
+            "L_base": stage_metrics["base"]["L"],
+            "L_before": stage_metrics["before"]["L"],
+            "L_after": stage_metrics["after"]["L"],
+        }])
+        csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+        
+        col_ex1.download_button(
+            label="📄 解析データ (CSV) ダウンロード",
+            data=csv_bytes,
+            file_name=f"lab_wash_data_{st.session_state.metadata['exp_id']}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+        
+        # JSON Export
+        json_export_data = {
+            "metadata": st.session_state.metadata,
+            "weights": st.session_state.weights,
+            "calib_points": st.session_state.calib_points,
+            "roi": st.session_state.roi,
+            "gauze_params": st.session_state.gauze_params,
+            "results": {
+                "W_weight": w_weight,
+                "W_L": w_L,
+                "W_KS": w_ks,
+                "dE00_residual": dE00_residual,
+                "stage_metrics": {
+                    k: {m: float(v) if isinstance(v, (np.floating, float)) else v.tolist() if isinstance(v, np.ndarray) else v for m, v in stage_metrics[k].items()}
+                    for k in stage_metrics
+                }
+            }
+        }
+        json_bytes = json.dumps(json_export_data, indent=2, ensure_ascii=False).encode("utf-8")
+        
+        col_ex2.download_button(
+            label="🌐 フル設定・データ (JSON) ダウンロード",
+            data=json_bytes,
+            file_name=f"lab_wash_config_{st.session_state.metadata['exp_id']}.json",
+            mime="application/json",
+            use_container_width=True
+        )
