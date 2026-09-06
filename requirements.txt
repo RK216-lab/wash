@@ -6,3 +6,5 @@ Pillow
 scikit-image
 plotly
 reportlab
+streamlit-cropper
+streamlit-image-coordinates
