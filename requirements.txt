@@ -2,9 +2,6 @@ streamlit
 opencv-python-headless
 numpy
 pandas
-Pillow
+pillow
 scikit-image
-plotly
-reportlab
-streamlit-cropper
-streamlit-image-coordinates
+streamlit-paste-button
